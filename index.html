@@ -3814,7 +3814,7 @@ img.image-loaded {
                             <input type="file" accept="application/json" onchange="importPostData(event)">
                         </label>
                     </div>
-                    <p class="admin-note">※「GitHubから最新を読み込む」でGitHubを最新状態として取得できます。編集後は「GitHubへ保存」でindex.htmlと画像を更新します。</p>
+                    <p class="admin-note">※管理画面で登録したデータはこのブラウザに一時保存され、「GitHubへ保存」を実行するとGitHubへ公開データとして反映されます。</p>
                 </form>
             </div>
 
@@ -3926,7 +3926,7 @@ img.image-loaded {
                     <button type="button" class="admin-secondary" onclick="resetTalentEditor()">新規追加</button>
                 </div>
 
-                <p class="admin-note">カード追加・画像・名前・種別・説明・プロフィール項目・SNS・更新情報・投稿データを編集できます。GitHub同期後はGitHub上のindex.htmlと画像が正本になります。</p>
+                <p class="admin-note">カード追加・画像・名前・種別・説明・プロフィール項目・SNS・更新情報・投稿データまで編集できます。画像はこのブラウザの保存領域に記録されます。</p>
 
                 <form id="talentEditorForm" class="admin-form">
                     <input id="talentEditIndex" type="hidden">
@@ -9285,8 +9285,8 @@ let adminPreviewUrl = null;
 ================================= */
 // 注意: HTMLだけの静的サイトでは認証情報を完全に秘密にできません。
 // 実運用ではサーバー側認証に置き換えてください。
-const ADMIN_LOGIN_ID = "noahx_admin";
-const ADMIN_LOGIN_PASSWORD = "adminpasswordnoa0620";
+const ADMIN_LOGIN_ID = "ADMIN_ID";
+const ADMIN_LOGIN_PASSWORD = "CHANGE_ME_PASSWORD";
 
 function requestAdminLogin(event) {
     if (event) event.preventDefault();
@@ -12072,89 +12072,340 @@ ensureHashtagDirectoryFinal();
 </script>
 
 
-<!-- NOAHX GITHUB SYNC: GitHub is the persistent source of truth -->
+<!-- NOAHX GITHUB PUBLISHER: GitHub is the source of truth -->
 <script>
 (function(){
   'use strict';
 
-  const GH_CONFIG_KEY='noahx-github-config-v2';
-  const LEGACY_CONFIG_KEY='noahx-github-config-v1';
-  let githubLoaded=false;
-  let githubAssetRoot='';
-  let syncTimer=null;
+  const GH_CONFIG_KEY = 'noahx-github-config-v2';
+  const GH_MARKER_START = '<!-- NOAHX_GITHUB_DATA_START -->';
+  const GH_MARKER_END = '<!-- NOAHX_GITHUB_DATA_END -->';
 
   function ghConfig(){
     try{
-      const current=JSON.parse(localStorage.getItem(GH_CONFIG_KEY)||'null');
-      const legacy=JSON.parse(localStorage.getItem(LEGACY_CONFIG_KEY)||'null');
-      return Object.assign({owner:'',repo:'',branch:'main',token:'',path:'index.html'},legacy||{},current||{});
+      return Object.assign({
+        owner:'noah0620',
+        repo:'noahx',
+        branch:'main',
+        token:'',
+        path:'index.html'
+      }, JSON.parse(localStorage.getItem(GH_CONFIG_KEY) || '{}'));
     }catch(e){
-      return {owner:'',repo:'',branch:'main',token:'',path:'index.html'};
+      return {owner:'noah0620',repo:'noahx',branch:'main',token:'',path:'index.html'};
     }
   }
 
   function saveGhConfig(c){
-    localStorage.setItem(GH_CONFIG_KEY,JSON.stringify(Object.assign({path:'index.html'},c)));
+    localStorage.setItem(GH_CONFIG_KEY, JSON.stringify(c));
   }
 
-  function ghStatus(message,error=false){
+  function ghEscape(v){
+    return typeof escapeHTML === 'function'
+      ? escapeHTML(v)
+      : String(v ?? '').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]));
+  }
+
+  function ghStatus(message, error){
     const el=document.getElementById('noahxGitHubStatus');
-    if(el){el.textContent=message;el.style.color=error?'#b91c1c':'#166534';}
+    if(!el)return;
+    el.textContent=message;
+    el.style.color=error ? '#b91c1c' : '#166534';
   }
 
-  function ghApiBase(requireToken=true){
+  function dataUrlParts(dataUrl){
+    const m=String(dataUrl||'').match(/^data:([^;,]+)?(;base64)?,(.*)$/s);
+    if(!m)return null;
+    const mime=m[1] || 'image/jpeg';
+    let base64;
+    if(m[2]){
+      base64=m[3];
+    }else{
+      base64=btoa(unescape(encodeURIComponent(decodeURIComponent(m[3]))));
+    }
+    return {mime,base64};
+  }
+
+  async function blobToBase64(blob){
+    const buffer=await blob.arrayBuffer();
+    const bytes=new Uint8Array(buffer);
+    let binary='';
+    const chunk=0x8000;
+    for(let i=0;i<bytes.length;i+=chunk){
+      binary += String.fromCharCode(...bytes.subarray(i,Math.min(i+chunk,bytes.length)));
+    }
+    return btoa(binary);
+  }
+
+  function extFromMime(mime){
+    const m=String(mime||'image/jpeg').toLowerCase();
+    if(m.includes('png'))return 'png';
+    if(m.includes('webp'))return 'webp';
+    if(m.includes('gif'))return 'gif';
+    return 'jpeg';
+  }
+
+  function safeFileId(v, fallback){
+    const x=String(v||fallback||'image').trim().replace(/[^a-zA-Z0-9._-]+/g,'-');
+    return x || fallback || 'image';
+  }
+
+  async function ghRequest(url, options){
     const c=ghConfig();
-    if(!c.owner||!c.repo||!c.branch||(requireToken&&!c.token)){
-      throw new Error(requireToken?'GitHubのOwner / Repository / Branch / Tokenを設定してください。':'GitHubのOwner / Repository / Branchを設定してください。');
+    const headers=Object.assign({
+      'Accept':'application/vnd.github+json',
+      'X-GitHub-Api-Version':'2022-11-28'
+    }, options?.headers || {});
+    if(c.token)headers.Authorization='Bearer '+c.token;
+    const response=await fetch(url,Object.assign({},options,{headers}));
+    const bodyText=await response.text();
+    let data=null;
+    try{data=bodyText?JSON.parse(bodyText):null}catch(e){data={message:bodyText};}
+    if(!response.ok){
+      const msg=(data&&data.message)||('GitHub API error '+response.status);
+      const err=new Error(msg);
+      err.status=response.status;
+      err.github=data;
+      throw err;
+    }
+    return data;
+  }
+
+  function ghApiBase(){
+    const c=ghConfig();
+    if(!c.owner||!c.repo||!c.branch||!c.token){
+      throw new Error('GitHubのOwner / Repository / Branch / Tokenを設定してください。');
     }
     return 'https://api.github.com/repos/'+encodeURIComponent(c.owner)+'/'+encodeURIComponent(c.repo);
   }
 
-  async function ghRequest(url,options={}){
-    const c=ghConfig();
-    const headers=Object.assign({'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'},options.headers||{});
-    if(c.token)headers.Authorization='Bearer '+c.token;
-    const response=await fetch(url,Object.assign({},options,{headers}));
-    const text=await response.text();
-    let data=null;
-    try{data=text?JSON.parse(text):null;}catch(e){data={message:text};}
-    if(!response.ok)throw new Error(data?.message||('GitHub API error '+response.status));
-    return data;
-  }
-
   async function getGhFile(path){
     const c=ghConfig();
-    const url=ghApiBase(true)+'/contents/'+path.split('/').map(encodeURIComponent).join('/')+'?ref='+encodeURIComponent(c.branch);
+    const url=ghApiBase()+'/contents/'+path.split('/').map(encodeURIComponent).join('/')+'?ref='+encodeURIComponent(c.branch);
     return ghRequest(url,{method:'GET'});
   }
 
   async function putGhFile(path,base64,message,sha){
     const c=ghConfig();
-    const url=ghApiBase(true)+'/contents/'+path.split('/').map(encodeURIComponent).join('/');
+    const url=ghApiBase()+'/contents/'+path.split('/').map(encodeURIComponent).join('/');
     const body={message,content:base64,branch:c.branch};
     if(sha)body.sha=sha;
-    return ghRequest(url,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    return ghRequest(url,{
+      method:'PUT',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(body)
+    });
   }
 
-  function decodeBase64Utf8(base64){
-    const clean=String(base64||'').replace(/\s/g,'');
-    const bin=atob(clean);
-    const bytes=new Uint8Array(bin.length);
-    for(let i=0;i<bin.length;i++)bytes[i]=bin.charCodeAt(i);
+  async function readLocalPosts(){
+    try{
+      if(typeof getAllLocalPosts==='function')return await getAllLocalPosts();
+    }catch(e){console.warn('GitHub公開用投稿取得失敗',e);}
+    return [];
+  }
+
+  async function imageFromPost(post){
+    if(post?.imageBlob instanceof Blob){
+      return {base64:await blobToBase64(post.imageBlob),mime:post.imageBlob.type||post.imageType||'image/jpeg'};
+    }
+    if(post?.imageUrl){
+      try{
+        const r=await fetch(post.imageUrl,{cache:'no-store'});
+        if(r.ok){
+          const b=await r.blob();
+          return {base64:await blobToBase64(b),mime:b.type||post.imageType||'image/jpeg'};
+        }
+      }catch(e){console.warn('投稿画像URL取得失敗',post.imageUrl,e);}
+    }
+    return null;
+  }
+
+  async function uploadImage(path,base64,message){
+    let sha=null;
+    try{
+      const old=await getGhFile(path);
+      sha=old.sha;
+    }catch(e){
+      if(e.status!==404 && !/404|Not Found/i.test(e.message))throw e;
+    }
+    return putGhFile(path,base64,message,sha);
+  }
+
+  function cleanObject(value){
+    if(value===undefined)return undefined;
+    if(value instanceof Blob)return undefined;
+    if(value&&typeof value==='object'){
+      if(Array.isArray(value))return value.map(cleanObject).filter(v=>v!==undefined);
+      const out={};
+      Object.keys(value).forEach(k=>{
+        if(k==='_objectUrl'||k==='imageBlob'||k==='imageUrl'||k==='imagePath'||k==='__hiddenByAdmin')return;
+        const v=cleanObject(value[k]);
+        if(v!==undefined)out[k]=v;
+      });
+      return out;
+    }
+    return value;
+  }
+
+  async function prepareTalentData(){
+    const data=JSON.parse(JSON.stringify(cleanObject(talents)));
+    const localPosts=await readLocalPosts();
+
+    for(const p of localPosts){
+      const ti=Number(p?.talentId);
+      const talent=data[ti];
+      if(!talent||!p?.id)continue;
+      if(!Array.isArray(talent.posts))talent.posts=[];
+      const clean=cleanObject(Object.assign({},p));
+      delete clean.talentId;
+      delete clean._cloud;
+      if(p.imageId)clean.imageId=String(p.imageId);
+      const exists=talent.posts.some(x=>String(x?.imageId||x?.id||'')===String(p.imageId||p.id));
+      if(!exists)talent.posts.push(clean);
+    }
+
+    for(let i=0;i<data.length;i++){
+      const talent=data[i];
+      if(!talent)continue;
+      const current=talents[i];
+      const raw=String(current?.imageId||'');
+      const parts=dataUrlParts(raw);
+      if(parts){
+        const ext=extFromMime(parts.mime);
+        const base=safeFileId('talent-'+i);
+        const folder=talent.type==='staff'?'staff':'cosplayer';
+        const path='images/'+folder+'/'+base+'.'+ext;
+        await uploadImage(path,parts.base64,'NoahX: update talent image '+(talent.name||base));
+        talent.imageId=base;
+      }
+    }
+
+    for(let ti=0;ti<data.length;ti++){
+      const talent=data[ti];
+      if(!talent)continue;
+      const folder=safeFileId(talent.postFolder||talent.imageId||('talent-'+ti));
+      const originals=Array.isArray(talents[ti]?.posts)?talents[ti].posts:[];
+      const merged=Array.isArray(talent.posts)?talent.posts:[];
+
+      for(let pi=0;pi<merged.length;pi++){
+        const post=merged[pi];
+        if(!post?.imageId)continue;
+
+        const original=originals.find(x=>String(x?.imageId||'')===String(post.imageId||''));
+        let img=null;
+
+        if(original?.imageBlob instanceof Blob){
+          img={base64:await blobToBase64(original.imageBlob),mime:original.imageBlob.type||'image/jpeg'};
+        }else{
+          const source=localPosts.find(x=>
+            Number(x?.talentId)===ti &&
+            String(x?.imageId||x?.id||'')===String(post.imageId||'')
+          );
+          if(source)img=await imageFromPost(source);
+        }
+
+        if(img){
+          const ext=extFromMime(img.mime);
+          const imageId=safeFileId(post.imageId,'post-'+pi);
+          const path='images/posts/'+folder+'/'+imageId+'.'+ext;
+          await uploadImage(path,img.base64,'NoahX: update post image '+imageId);
+          post.imageId=imageId;
+        }
+
+        delete post.imageBlob;
+        delete post.imageUrl;
+        delete post.imagePath;
+        delete post._local;
+        delete post._objectUrl;
+      }
+    }
+
+    return data;
+  }
+
+  function replaceJsArray(source,marker,newValue){
+    const start=source.indexOf(marker);
+    if(start<0)throw new Error(marker+' がGitHub上のindex.htmlに見つかりません。');
+    const open=source.indexOf('[',start);
+    if(open<0)throw new Error(marker+' の配列開始位置が見つかりません。');
+
+    let depth=0,quote=null,escape=false,lineComment=false,blockComment=false;
+    for(let i=open;i<source.length;i++){
+      const ch=source[i],next=source[i+1];
+      if(lineComment){if(ch==='\n')lineComment=false;continue;}
+      if(blockComment){if(ch==='*'&&next==='/'){blockComment=false;i++;}continue;}
+      if(quote){
+        if(escape){escape=false;continue;}
+        if(ch==='\\'){escape=true;continue;}
+        if(ch===quote)quote=null;
+        continue;
+      }
+      if(ch==='/'&&next==='/'){lineComment=true;i++;continue;}
+      if(ch==='/'&&next==='*'){blockComment=true;i++;continue;}
+      if(ch==='"'||ch==="'"||ch==='`'){quote=ch;continue;}
+      if(ch==='[')depth++;
+      else if(ch===']'){
+        depth--;
+        if(depth===0){
+          return source.slice(0,start)+marker+' '+JSON.stringify(newValue,null,4)+source.slice(i+1);
+        }
+      }
+    }
+    throw new Error(marker+' の配列終了位置が見つかりません。');
+  }
+
+  function replaceJsObject(source,marker,newValue){
+    const start=source.indexOf(marker);
+    if(start<0)throw new Error(marker+' がGitHub上のindex.htmlに見つかりません。');
+    const open=source.indexOf('{',start);
+    if(open<0)throw new Error(marker+' のオブジェクト開始位置が見つかりません。');
+
+    let depth=0,quote=null,escape=false,lineComment=false,blockComment=false;
+    for(let i=open;i<source.length;i++){
+      const ch=source[i],next=source[i+1];
+      if(lineComment){if(ch==='\n')lineComment=false;continue;}
+      if(blockComment){if(ch==='*'&&next==='/'){blockComment=false;i++;}continue;}
+      if(quote){
+        if(escape){escape=false;continue;}
+        if(ch==='\\'){escape=true;continue;}
+        if(ch===quote)quote=null;
+        continue;
+      }
+      if(ch==='/'&&next==='/'){lineComment=true;i++;continue;}
+      if(ch==='/'&&next==='*'){blockComment=true;i++;continue;}
+      if(ch==='"'||ch==="'"||ch==='`'){quote=ch;continue;}
+      if(ch==='{')depth++;
+      else if(ch==='}'){
+        depth--;
+        if(depth===0)return source.slice(0,start)+marker+' '+JSON.stringify(newValue,null,4)+source.slice(i+1);
+      }
+    }
+    throw new Error(marker+' のオブジェクト終了位置が見つかりません。');
+  }
+
+  function decodeBase64Utf8(value){
+    const clean=String(value||'').replace(/\s/g,'');
+    const bytes=Uint8Array.from(atob(clean),c=>c.charCodeAt(0));
     return new TextDecoder('utf-8').decode(bytes);
   }
 
-  function utf8Base64(text){
-    const bytes=new TextEncoder().encode(text);
+  function utf8Base64(value){
+    const bytes=new TextEncoder().encode(String(value));
     let binary='';
     const chunk=0x8000;
-    for(let i=0;i<bytes.length;i+=chunk)binary+=String.fromCharCode(...bytes.subarray(i,Math.min(i+chunk,bytes.length)));
+    for(let i=0;i<bytes.length;i+=chunk){
+      binary+=String.fromCharCode(...bytes.subarray(i,Math.min(i+chunk,bytes.length)));
+    }
     return btoa(binary);
   }
 
-  function findBalanced(source,startCharIndex,openChar,closeChar){
+  function extractJsValue(source,marker,openChar,closeChar){
+    const start=source.indexOf(marker);
+    if(start<0)throw new Error(marker+' がGitHub上のindex.htmlに見つかりません。');
+    const open=source.indexOf(openChar,start);
+    if(open<0)throw new Error(marker+' の開始位置が見つかりません。');
+
     let depth=0,quote=null,escape=false,lineComment=false,blockComment=false;
-    for(let i=startCharIndex;i<source.length;i++){
+    for(let i=open;i<source.length;i++){
       const ch=source[i],next=source[i+1];
       if(lineComment){if(ch==='\n')lineComment=false;continue;}
       if(blockComment){if(ch==='*'&&next==='/'){blockComment=false;i++;}continue;}
@@ -12170,305 +12421,233 @@ ensureHashtagDirectoryFinal();
       if(ch===openChar)depth++;
       else if(ch===closeChar){
         depth--;
-        if(depth===0)return {text:source.slice(startCharIndex,i+1),end:i+1};
+        if(depth===0)return source.slice(open,i+1);
       }
     }
-    throw new Error('GitHub上のデータ構造を読み取れませんでした。');
+    throw new Error(marker+' の終了位置が見つかりません。');
   }
 
-  function extractJsValue(source,marker,openChar,closeChar){
-    const markerIndex=source.indexOf(marker);
-    if(markerIndex<0)throw new Error(marker+' がGitHub上のindex.htmlに見つかりません。');
-    const open=source.indexOf(openChar,markerIndex+marker.length);
-    if(open<0)throw new Error(marker+' のデータ開始位置が見つかりません。');
-    return findBalanced(source,open,openChar,closeChar).text;
+  async function getLatestIndex(){
+    const file=await getGhFile('index.html');
+    return {file,source:decodeBase64Utf8(file.content)};
   }
 
-  function parseJsValue(source,marker,openChar,closeChar){
-    const literal=extractJsValue(source,marker,openChar,closeChar);
+  async function loadFromGitHub(){
+    const c=ghConfig();
+    if(!c.owner||!c.repo||!c.branch||!c.token)throw new Error('GitHub設定が不足しています。');
+
+    ghStatus('① GitHubの最新index.htmlを取得しています…',false);
+    const latest=await getLatestIndex();
+
+    const talentsExpr=extractJsValue(latest.source,'const talents =','[',']');
+    const siteExpr=extractJsValue(latest.source,'const siteUpdate =','{','}');
+
+    let loadedTalents,loadedSite;
     try{
-      return Function('"use strict";return ('+literal+');')();
+      loadedTalents=Function('"use strict"; return ('+talentsExpr+');')();
+      loadedSite=Function('"use strict"; return ('+siteExpr+');')();
     }catch(e){
-      throw new Error(marker+' のデータ解析に失敗しました：'+e.message);
+      throw new Error('GitHub上のデータ解析に失敗しました。index.htmlのデータ形式を確認してください。');
     }
-  }
 
-  function setRemoteAssetRoot(){
-    const c=ghConfig();
-    githubAssetRoot='https://raw.githubusercontent.com/'+encodeURIComponent(c.owner)+'/'+encodeURIComponent(c.repo)+'/'+encodeURIComponent(c.branch)+'/';
-  }
+    if(!Array.isArray(loadedTalents))throw new Error('GitHub上のtalentsデータが配列ではありません。');
 
-  function remoteImageBase(type,id){
-    const v=String(id||'');
-    if(/^(https?:|data:|blob:)/i.test(v))return v;
-    if(!githubLoaded||!githubAssetRoot)return '';
-    return githubAssetRoot+'images/'+encodeURIComponent(type)+'/'+encodeURIComponent(id);
-  }
-
-  function remotePostImageBase(talentId,id){
-    const v=String(id||'');
-    if(/^(https?:|data:|blob:)/i.test(v))return v;
-    if(!githubLoaded||!githubAssetRoot)return '';
-    return githubAssetRoot+'images/posts/'+encodeURIComponent(talentId)+'/'+encodeURIComponent(id);
-  }
-
-  // GitHubを読み込んだ後は、画像もGitHub上の実ファイルを直接参照する。
-  const originalGetImageBase=window.getImageBase;
-  window.getImageBase=function(type,id){
-    const remote=remoteImageBase(type,id);
-    return remote|| (originalGetImageBase?originalGetImageBase(type,id):'');
-  };
-  const originalGetPostImageBase=window.getPostImageBase;
-  window.getPostImageBase=function(talentId,id){
-    const remote=remotePostImageBase(talentId,id);
-    return remote|| (originalGetPostImageBase?originalGetPostImageBase(talentId,id):'');
-  };
-
-  function refreshAllViews(){
-    window.__noahxBaseTalentCount=talents.length;
-    try{createTalentCards();}catch(e){console.warn('カード再描画:',e);}
-    try{refreshTalentEditorSelect();}catch(e){console.warn('タレント選択再描画:',e);}
-    try{populateAdminTalents();}catch(e){console.warn('管理タレント再描画:',e);}
-    try{refreshPostEditorChoicesFinal();}catch(e){console.warn('投稿選択再描画:',e);}
-    try{renderSiteUpdate();}catch(e){console.warn('サイト更新再描画:',e);}
-    try{renderLatestPosts();}catch(e){console.warn('最新投稿再描画:',e);}
-    try{renderHashtagDirectory();}catch(e){console.warn('ハッシュタグ再描画:',e);}
-    try{renderHashtagDirectoryFinal();}catch(e){console.warn('ハッシュタグ再描画2:',e);}
-    try{renderCurrentCalendar();}catch(e){/* カレンダー対象未選択なら無視 */}
-    try{refreshAdminPostList();}catch(e){/* 管理画面を開いていない場合は無視 */}
-  }
-
-  async function loadLatestFromGitHub(){
-    const c=ghConfig();
-    if(!c.owner||!c.repo||!c.branch||!c.token)throw new Error('GitHubのOwner / Repository / Branch / Tokenを設定してください。');
-
-    ghStatus('① GitHubから最新のindex.htmlを取得しています…');
-    const file=await getGhFile(c.path||'index.html');
-    const html=decodeBase64Utf8(file.content);
-
-    ghStatus('② 最新のタレント・投稿・サイト情報を読み込んでいます…');
-    const remoteSiteUpdate=parseJsValue(html,'const siteUpdate =','{','}');
-    const remoteTalents=parseJsValue(html,'const talents =','[',']');
-    if(!Array.isArray(remoteTalents))throw new Error('GitHubのtalentsデータが配列ではありません。');
-
-    // 現在のconst配列そのものを置き換えず、中身だけ更新する。
-    talents.splice(0,talents.length,...remoteTalents);
-    if(typeof siteUpdate==='object'&&siteUpdate!==null){
+    // const talents は再代入できないため、中身を置き換える。
+    if(Array.isArray(talents)){
+      talents.splice(0,talents.length,...loadedTalents);
+    }
+    if(siteUpdate&&typeof siteUpdate==='object'&&loadedSite&&typeof loadedSite==='object'){
       Object.keys(siteUpdate).forEach(k=>delete siteUpdate[k]);
-      Object.assign(siteUpdate,remoteSiteUpdate||{});
+      Object.assign(siteUpdate,loadedSite);
     }
 
-    // ローカルの一時データがGitHubより後から上書きしないようにする。
-    try{localStorage.removeItem('noahxTalentAdminData');}catch(e){}
-    try{localStorage.removeItem('noahxSiteAdminData');}catch(e){}
+    // GitHubを読み込んだ状態を画面へ反映。
+    try{ if(typeof renderLatestPosts==='function')renderLatestPosts(); }catch(e){}
+    try{ if(typeof renderCurrentCalendar==='function')renderCurrentCalendar(); }catch(e){}
+    try{ if(typeof renderSiteUpdate==='function')renderSiteUpdate(); }catch(e){}
+    try{ if(typeof renderPostArchive==='function')renderPostArchive(); }catch(e){}
+    try{ if(typeof loadSiteDataEditorFinal==='function')loadSiteDataEditorFinal(); }catch(e){}
+    try{ if(typeof populatePostEditorTalentsFinal==='function')populatePostEditorTalentsFinal(''); }catch(e){}
+    try{ if(typeof refreshPostEditorChoicesFinal==='function')refreshPostEditorChoicesFinal(); }catch(e){}
+    try{ if(typeof refreshAdminPostList==='function')refreshAdminPostList(); }catch(e){}
+    try{ if(typeof renderHashtagDirectoryFinal==='function')renderHashtagDirectoryFinal(); }catch(e){}
 
-    githubLoaded=true;
-    setRemoteAssetRoot();
-    refreshAllViews();
-
-    ghStatus('③ 最新データの読み込み完了。GitHubを正本として表示しています。');
-    return {file,html,talents:remoteTalents,siteUpdate:remoteSiteUpdate};
+    ghStatus('GitHubから最新データを読み込みました。タレント '+loadedTalents.length+'件。',false);
+    return {file:latest.file,talents:loadedTalents,siteUpdate:loadedSite};
   }
 
-  function dataUrlParts(dataUrl){
-    const m=String(dataUrl||'').match(/^data:([^;,]+)?(;base64)?,(.*)$/s);
-    if(!m)return null;
-    return {mime:m[1]||'image/jpeg',base64:m[2]?m[3]:btoa(unescape(encodeURIComponent(decodeURIComponent(m[3]))))};
-  }
+  async function checkGitHubAccess(){
+    const c=ghConfig();
+    if(!c.owner||!c.repo||!c.branch||!c.token)throw new Error('GitHub設定が不足しています。');
 
-  async function blobToBase64(blob){
-    const buffer=await blob.arrayBuffer();
-    let binary='';
-    const bytes=new Uint8Array(buffer);
-    for(let i=0;i<bytes.length;i+=0x8000)binary+=String.fromCharCode(...bytes.subarray(i,Math.min(i+0x8000,bytes.length)));
-    return btoa(binary);
-  }
+    ghStatus('① GitHub Repositoryの権限を確認しています…',false);
+    const repo=await ghRequest(
+      'https://api.github.com/repos/'+encodeURIComponent(c.owner)+'/'+encodeURIComponent(c.repo),
+      {method:'GET'}
+    );
 
-  function extFromMime(mime){
-    const m=String(mime||'image/jpeg').toLowerCase();
-    if(m.includes('png'))return 'png';
-    if(m.includes('webp'))return 'webp';
-    if(m.includes('gif'))return 'gif';
-    return 'jpeg';
-  }
-
-  function safeFileId(v,fallback){
-    const x=String(v||fallback||'image').trim().replace(/[^a-zA-Z0-9._-]+/g,'-');
-    return x||fallback||'image';
-  }
-
-  async function imageFromPost(post){
-    if(post?.imageBlob instanceof Blob)return {base64:await blobToBase64(post.imageBlob),mime:post.imageBlob.type||post.imageType||'image/jpeg'};
-    if(post?.imageUrl){
-      try{const r=await fetch(post.imageUrl,{cache:'no-store'});if(r.ok){const b=await r.blob();return {base64:await blobToBase64(b),mime:b.type||post.imageType||'image/jpeg'};}}catch(e){}
+    if(repo.private===true && repo.permissions && repo.permissions.push!==true){
+      throw new Error('Repositoryへの書き込み権限がありません。TokenのContents: Read and writeを確認してください。');
     }
-    return null;
-  }
 
-  async function uploadImage(path,base64,message){
-    let sha=null;
-    try{sha=(await getGhFile(path)).sha;}catch(e){if(!/404|Not Found/i.test(e.message))throw e;}
-    return putGhFile(path,base64,message,sha);
-  }
+    ghStatus('② index.htmlの読み取り権限を確認しています…',false);
+    const file=await getGhFile('index.html');
 
-  function cleanObject(value){
-    if(value===undefined||value instanceof Blob)return undefined;
-    if(value&&typeof value==='object'){
-      if(Array.isArray(value))return value.map(cleanObject).filter(v=>v!==undefined);
-      const out={};
-      Object.keys(value).forEach(k=>{
-        if(['_objectUrl','imageBlob','imageUrl','imagePath','__hiddenByAdmin'].includes(k))return;
-        const v=cleanObject(value[k]);
-        if(v!==undefined)out[k]=v;
-      });
-      return out;
-    }
-    return value;
-  }
-
-  async function readLocalPosts(){
-    try{return typeof getAllLocalPosts==='function'?await getAllLocalPosts():[];}catch(e){return [];}
-  }
-
-  async function prepareTalentData(){
-    const data=JSON.parse(JSON.stringify(cleanObject(talents)));
-    const localPosts=await readLocalPosts();
-    for(const p of localPosts){
-      const ti=Number(p?.talentId),talent=data[ti];
-      if(!talent||!p?.id)continue;
-      if(!Array.isArray(talent.posts))talent.posts=[];
-      const clean=cleanObject(Object.assign({},p));
-      delete clean.talentId;delete clean._cloud;
-      const exists=talent.posts.some(x=>String(x?.imageId||x?.id||'')===String(p.imageId||p.id));
-      if(!exists)talent.posts.push(clean);
-    }
-    for(let i=0;i<data.length;i++){
-      const talent=data[i],current=talents[i];
-      if(!talent)continue;
-      const raw=String(current?.imageId||'');
-      const parts=dataUrlParts(raw);
-      if(parts){
-        const ext=extFromMime(parts.mime),base=safeFileId('talent-'+i),path='images/'+(talent.type||'cosplayer')+'/'+base+'.'+ext;
-        await uploadImage(path,parts.base64,'NoahX: update talent image '+(talent.name||base));
-        talent.imageId=base;
-      }
-    }
-    for(let ti=0;ti<data.length;ti++){
-      const talent=data[ti];if(!talent)continue;
-      const folder=safeFileId(talent.postFolder||talent.imageId||('talent-'+ti));
-      const originals=Array.isArray(talents[ti]?.posts)?talents[ti].posts:[];
-      const merged=Array.isArray(talent.posts)?talent.posts:[];
-      for(let pi=0;pi<merged.length;pi++){
-        const post=merged[pi];if(!post?.imageId)continue;
-        const original=originals.find(x=>String(x?.imageId||'')===String(post.imageId||''));
-        let img=null;
-        if(original?.imageBlob instanceof Blob)img={base64:await blobToBase64(original.imageBlob),mime:original.imageBlob.type||'image/jpeg'};
-        else{const source=localPosts.find(x=>Number(x?.talentId)===ti&&String(x?.imageId||x?.id||'')===String(post.imageId||''));if(source)img=await imageFromPost(source);}
-        if(img){
-          const ext=extFromMime(img.mime),imageId=safeFileId(post.imageId,'post-'+pi),path='images/posts/'+folder+'/'+imageId+'.'+ext;
-          await uploadImage(path,img.base64,'NoahX: update post image '+imageId);
-          post.imageId=imageId;
-        }
-        delete post.imageBlob;delete post.imageUrl;delete post.imagePath;delete post._local;delete post._objectUrl;
-      }
-    }
-    return data;
-  }
-
-  function replaceJsValue(source,marker,newValue,openChar,closeChar){
-    const markerIndex=source.indexOf(marker);
-    if(markerIndex<0)throw new Error(marker+' がindex.html内に見つかりません。');
-    const open=source.indexOf(openChar,markerIndex+marker.length);
-    if(open<0)throw new Error(marker+' の開始位置が見つかりません。');
-    const balanced=findBalanced(source,open,openChar,closeChar);
-    return source.slice(0,open)+JSON.stringify(newValue,null,4)+source.slice(balanced.end);
+    ghStatus(
+      '接続成功：'+c.owner+'/'+c.repo+' / '+c.branch+
+      '　Contents読み取りOK'+
+      (repo.permissions?.push===true?'・書き込み権限OK':''),
+      false
+    );
+    return {repo,file};
   }
 
   async function publishToGitHub(){
-    const owner=document.getElementById('noahxGitHubOwner')?.value.trim()||ghConfig().owner;
-    const repo=document.getElementById('noahxGitHubRepo')?.value.trim()||ghConfig().repo;
-    const branch=document.getElementById('noahxGitHubBranch')?.value.trim()||'main';
-    const token=document.getElementById('noahxGitHubToken')?.value.trim()||ghConfig().token;
-    saveGhConfig({owner,repo,branch,token,path:'index.html'});
-    if(!owner||!repo||!branch||!token)throw new Error('GitHub設定が不足しています。');
+    const old=ghConfig();
+    saveGhConfig({
+      owner:document.getElementById('noahxGitHubOwner')?.value.trim()||old.owner,
+      repo:document.getElementById('noahxGitHubRepo')?.value.trim()||old.repo,
+      branch:document.getElementById('noahxGitHubBranch')?.value.trim()||old.branch||'main',
+      token:document.getElementById('noahxGitHubToken')?.value.trim()||old.token,
+      path:'index.html'
+    });
 
-    ghStatus('① GitHubの現在のindex.htmlを取得しています…');
-    const file=await getGhFile('index.html');
-    const decoded=decodeBase64Utf8(file.content);
-    ghStatus('② 管理画面の最新データと画像をまとめています…');
+    const cfg=ghConfig();
+    if(!cfg.owner||!cfg.repo||!cfg.branch||!cfg.token)throw new Error('GitHub設定が不足しています。');
+
+    // 保存直前に必ず最新SHAを取得する。これで古いSHAによる競合を防ぐ。
+    ghStatus('① 保存直前のGitHub index.htmlを取得しています…',false);
+    const latest=await getLatestIndex();
+
+    ghStatus('② 管理画面の最新データと画像を準備しています…',false);
     const prepared=await prepareTalentData();
-    let next=decoded;
-    next=replaceJsValue(next,'const siteUpdate =',typeof siteUpdate!=='undefined'?siteUpdate:{},'{','}');
-    next=replaceJsValue(next,'const talents =',prepared,'[',']');
-    ghStatus('③ GitHubへindex.htmlを保存しています…');
-    await putGhFile('index.html',utf8Base64(next),'NoahX: update site data and images',file.sha);
-    githubLoaded=true;setRemoteAssetRoot();
-    ghStatus('保存完了。GitHub Pagesへの反映を待っています。');
+
+    let next=latest.source;
+    next=replaceJsObject(next,'const siteUpdate =',typeof siteUpdate!=='undefined'?siteUpdate:{});
+    next=replaceJsArray(next,'const talents =',prepared);
+
+    next=next.replace(/\n?<!-- NOAHX_GITHUB_DATA_START -->[\s\S]*?<!-- NOAHX_GITHUB_DATA_END -->/g,'');
+    next+='\n\n'+GH_MARKER_START+
+      '\n<!-- Generated by NoahX GitHub Publisher: '+new Date().toISOString()+' -->'+
+      '\n'+GH_MARKER_END+'\n';
+
+    ghStatus('③ GitHubへindex.htmlを保存しています…',false);
+    try{
+      await putGhFile(
+        'index.html',
+        utf8Base64(next),
+        'NoahX: update index.html from admin',
+        latest.file.sha
+      );
+    }catch(e){
+      if(e.status===409){
+        throw new Error('保存中にGitHub側のindex.htmlが変更されました。もう一度「GitHubから最新を読み込む」→「GitHubへ保存」を実行してください。');
+      }
+      if(e.status===403){
+        throw new Error('GitHubから拒否されました。Tokenの対象Repositoryと Contents: Read and write を確認してください。');
+      }
+      throw e;
+    }
+
+    ghStatus('保存完了：index.htmlと画像をGitHubへ反映しました。GitHub Pagesへの反映には少し時間がかかる場合があります。',false);
+    return true;
   }
 
   function ensureGitHubCard(){
     const admin=document.querySelector('#adminPage .admin-panel');
     if(!admin||document.getElementById('noahxGitHubCard'))return;
+
     const c=ghConfig();
-    const card=document.createElement('section');
-    card.className='admin-card';card.id='noahxGitHubCard';
-    card.innerHTML=`
-      <div class="admin-list-header"><h2>GitHub データ管理</h2><span id="noahxGitHubBadge" class="admin-note">${c.owner&&c.repo?'設定済み':'未設定'}</span></div>
-      <p class="admin-note">GitHub上の <strong>index.html・投稿データ・画像</strong> をサイトの正本として使用します。まず「最新を読み込む」でGitHubの状態を管理画面へ反映し、編集後に「GitHubへ保存」してください。</p>
-      <div class="admin-grid-2">
-        <label>Owner / ユーザー名<input id="noahxGitHubOwner" type="text" value="${escapeHTML(c.owner||'')}" placeholder="例：your-account"></label>
-        <label>Repository<input id="noahxGitHubRepo" type="text" value="${escapeHTML(c.repo||'')}" placeholder="例：noahx-japan"></label>
-      </div>
-      <div class="admin-grid-2">
-        <label>Branch<input id="noahxGitHubBranch" type="text" value="${escapeHTML(c.branch||'main')}" placeholder="main"></label>
-        <label>Token<input id="noahxGitHubToken" type="password" value="${escapeHTML(c.token||'')}" placeholder="github_pat_..."></label>
-      </div>
-      <div class="admin-actions">
-        <button type="button" class="admin-primary" id="noahxGitHubLoad">GitHubから最新を読み込む</button>
-        <button type="button" class="admin-primary" id="noahxGitHubPublish">GitHubへ保存</button>
-        <button type="button" class="admin-secondary" id="noahxGitHubTest">接続テスト</button>
-      </div>
-      <div id="noahxGitHubStatus" class="admin-note">${c.owner&&c.repo&&c.token?'接続情報は保存済みです。':'Owner / Repository / Branch / Tokenを設定してください。'}</div>
-      <p class="admin-note">⚠️ Fine-grained PATを推奨します。対象Repositoryだけに限定し、Contents: Read and writeを付与してください。</p>`;
+    const card=document.createElement('div');
+    card.className='admin-card';
+    card.id='noahxGitHubCard';
+    card.innerHTML=
+      '<h2>GitHub データ管理</h2>'+
+      '<p class="admin-note">GitHub <strong>noah0620/noahx</strong> をサイトの正本として使用します。まず「GitHubから最新を読み込む」で最新状態を取得し、編集後に「GitHubへ保存」を押してください。</p>'+
+      '<label>GitHub Owner / ユーザー名<input id="noahxGitHubOwner" type="text" value="'+ghEscape(c.owner)+'" placeholder="noah0620"></label>'+
+      '<label>Repository<input id="noahxGitHubRepo" type="text" value="'+ghEscape(c.repo)+'" placeholder="noahx"></label>'+
+      '<label>Branch<input id="noahxGitHubBranch" type="text" value="'+ghEscape(c.branch||'main')+'" placeholder="main"></label>'+
+      '<label>GitHub Token <span style="font-weight:400">(Fine-grained / Contents: Read and write)</span><input id="noahxGitHubToken" type="password" value="'+ghEscape(c.token)+'" placeholder="github_pat_..."></label>'+
+      '<div class="admin-actions" style="display:flex;flex-wrap:wrap;gap:8px;">'+
+        '<button type="button" class="admin-secondary" id="noahxGitHubLoad">GitHubから最新を読み込む</button>'+
+        '<button type="button" class="admin-primary" id="noahxGitHubPublish">GitHubへ保存</button>'+
+        '<button type="button" class="admin-secondary" id="noahxGitHubTest">接続・権限テスト</button>'+
+      '</div>'+
+      '<p class="admin-note">TokenはこのブラウザのlocalStorageに保存されます。共有PCでは保存しないでください。Tokenはチャット等へ貼り付けないでください。</p>'+
+      '<div id="noahxGitHubStatus" class="admin-note">'+(c.owner&&c.repo&&c.token?'設定済み':'未設定')+'</div>';
     admin.prepend(card);
 
-    const saveInputs=()=>saveGhConfig({owner:card.querySelector('#noahxGitHubOwner').value.trim(),repo:card.querySelector('#noahxGitHubRepo').value.trim(),branch:card.querySelector('#noahxGitHubBranch').value.trim()||'main',token:card.querySelector('#noahxGitHubToken').value.trim(),path:'index.html'});
+    function collectConfig(){
+      const current=ghConfig();
+      saveGhConfig({
+        owner:card.querySelector('#noahxGitHubOwner').value.trim(),
+        repo:card.querySelector('#noahxGitHubRepo').value.trim(),
+        branch:card.querySelector('#noahxGitHubBranch').value.trim()||'main',
+        token:card.querySelector('#noahxGitHubToken').value.trim()||current.token,
+        path:'index.html'
+      });
+    }
 
-    card.querySelector('#noahxGitHubTest').onclick=async()=>{try{saveInputs();ghStatus('GitHubへ接続しています…');await getGhFile('index.html');ghStatus('接続成功。GitHubのindex.htmlを取得できます。');}catch(e){ghStatus('接続失敗：'+e.message,true);}};
-    card.querySelector('#noahxGitHubLoad').onclick=async()=>{const b=card.querySelector('#noahxGitHubLoad');try{saveInputs();b.disabled=true;await loadLatestFromGitHub();}catch(e){console.error(e);ghStatus('読み込み失敗：'+e.message,true);}finally{b.disabled=false;}};
-    card.querySelector('#noahxGitHubPublish').onclick=async()=>{const b=card.querySelector('#noahxGitHubPublish');try{saveInputs();b.disabled=true;await publishToGitHub();}catch(e){console.error(e);ghStatus('保存失敗：'+e.message,true);}finally{b.disabled=false;}};
+    card.querySelector('#noahxGitHubTest').onclick=async()=>{
+      try{
+        collectConfig();
+        await checkGitHubAccess();
+      }catch(e){
+        console.error(e);
+        ghStatus('接続・権限テスト失敗：'+e.message,true);
+      }
+    };
+
+    card.querySelector('#noahxGitHubLoad').onclick=async()=>{
+      const btn=card.querySelector('#noahxGitHubLoad');
+      btn.disabled=true;
+      try{
+        collectConfig();
+        await loadFromGitHub();
+      }catch(e){
+        console.error(e);
+        ghStatus('GitHub読み込み失敗：'+e.message,true);
+      }finally{btn.disabled=false;}
+    };
+
+    card.querySelector('#noahxGitHubPublish').onclick=async()=>{
+      const btn=card.querySelector('#noahxGitHubPublish');
+      btn.disabled=true;
+      try{
+        collectConfig();
+        await publishToGitHub();
+      }catch(e){
+        console.error(e);
+        ghStatus('GitHub保存失敗：'+e.message,true);
+      }finally{btn.disabled=false;}
+    };
   }
 
-  function scheduleGitHubSync(){
-    const c=ghConfig();
-    if(!githubLoaded||!c.owner||!c.repo||!c.token)return;
-    clearTimeout(syncTimer);
-    syncTimer=setTimeout(()=>publishToGitHub().catch(e=>console.warn('GitHub自動保存:',e)),1500);
-  }
-
-  // 管理画面の保存はローカル処理を維持しつつ、GitHubを読み込んでいる時だけ自動同期する。
-  if(typeof window.saveTalentAdminData==='function'){
-    const old=window.saveTalentAdminData;
-    window.saveTalentAdminData=async function(){const r=await old.apply(this,arguments);scheduleGitHubSync();return r;};
-  }
-  if(typeof window.saveLocalPost==='function'){
-    const old=window.saveLocalPost;
-    window.saveLocalPost=async function(){const r=await old.apply(this,arguments);scheduleGitHubSync();return r;};
-  }
-  if(typeof window.deleteLocalPost==='function'){
-    const old=window.deleteLocalPost;
-    window.deleteLocalPost=async function(){const r=await old.apply(this,arguments);scheduleGitHubSync();return r;};
-  }
-  document.addEventListener('submit',ev=>{
-    if(['siteDataEditorForm','talentEditorForm','postUploadForm','postEditorForm'].includes(ev.target?.id))setTimeout(scheduleGitHubSync,200);
-  },true);
-
+  // 管理画面を開いた時だけGitHubカードを追加。
   const oldOpen=window.openAdminPage;
-  if(oldOpen)window.openAdminPage=function(){const r=oldOpen.apply(this,arguments);setTimeout(ensureGitHubCard,50);return r;};
+  if(oldOpen){
+    window.openAdminPage=function(){
+      const r=oldOpen.apply(this,arguments);
+      setTimeout(ensureGitHubCard,0);
+      return r;
+    };
+  }
 
-  window.__noahxGitHub={load:loadLatestFromGitHub,publish:publishToGitHub,config:ghConfig};
-  if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',()=>setTimeout(ensureGitHubCard,100));
-  else setTimeout(ensureGitHubCard,100);
+  // 自動保存は停止。保存先をGitHubに一本化し、二重更新・SHA競合を防ぐ。
+  // 変更は管理画面で行い、最後に「GitHubへ保存」を押す。
+
+  window.__noahxGitHubPublisher={
+    publish:publishToGitHub,
+    load:loadFromGitHub,
+    test:checkGitHubAccess,
+    config:ghConfig
+  };
+
+  if(document.readyState==='loading'){
+    document.addEventListener('DOMContentLoaded',()=>setTimeout(ensureGitHubCard,200));
+  }else{
+    setTimeout(ensureGitHubCard,200);
+  }
 })();
 </script>
 
