@@ -3814,7 +3814,7 @@ img.image-loaded {
                             <input type="file" accept="application/json" onchange="importPostData(event)">
                         </label>
                     </div>
-                    <p class="admin-note">※Supabase接続済みの場合、管理者が登録した画像はStorage、投稿情報はDatabaseへ保存され、別端末・別ブラウザでも同じ投稿が表示されます。Supabase未接続時のみ、このブラウザのIndexedDBへ保存します。</p>
+                    <p class="admin-note">※「GitHubから最新を読み込む」でGitHubを最新状態として取得できます。編集後は「GitHubへ保存」でindex.htmlと画像を更新します。</p>
                 </form>
             </div>
 
@@ -3926,7 +3926,7 @@ img.image-loaded {
                     <button type="button" class="admin-secondary" onclick="resetTalentEditor()">新規追加</button>
                 </div>
 
-                <p class="admin-note">カード追加・画像・名前・種別・説明・プロフィール項目・SNS・更新情報・投稿データまで編集できます。画像はこのブラウザの保存領域に記録されます。</p>
+                <p class="admin-note">カード追加・画像・名前・種別・説明・プロフィール項目・SNS・更新情報・投稿データを編集できます。GitHub同期後はGitHub上のindex.htmlと画像が正本になります。</p>
 
                 <form id="talentEditorForm" class="admin-form">
                     <input id="talentEditIndex" type="hidden">
@@ -9285,8 +9285,8 @@ let adminPreviewUrl = null;
 ================================= */
 // 注意: HTMLだけの静的サイトでは認証情報を完全に秘密にできません。
 // 実運用ではサーバー側認証に置き換えてください。
-const ADMIN_LOGIN_ID = "ADMIN_ID";
-const ADMIN_LOGIN_PASSWORD = "CHANGE_ME_PASSWORD";
+const ADMIN_LOGIN_ID = "noahx_admin";
+const ADMIN_LOGIN_PASSWORD = "adminpasswordnoa0620";
 
 function requestAdminLogin(event) {
     if (event) event.preventDefault();
@@ -12072,246 +12072,405 @@ ensureHashtagDirectoryFinal();
 </script>
 
 
-<!-- NOAHX CLOUD SYNC: Supabase-backed nationwide publishing -->
-<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<!-- NOAHX GITHUB SYNC: GitHub is the persistent source of truth -->
 <script>
 (function(){
   'use strict';
-  const CLOUD_CONFIG_KEY='noahx-supabase-config-v1';
-  const cloudDefault={url:'https://qfvvdznaqxrkclqkojyv.supabase.co',key:'sb_publishable_oY20YdciWniDvMFA5OlY0A_Pl5W22ZC',bucket:'noahx-images'};
-  let cloudClient=null;
-  let cloudReady=false;
-  let cloudLoaded=false;
-  let cloudPostsCache=[];
-  let cloudTalentRows=[];
 
-  function cloudConfig(){try{return {...cloudDefault,...JSON.parse(localStorage.getItem(CLOUD_CONFIG_KEY)||'{}')}}catch{return {...cloudDefault}}}
-  function setCloudConfig(c){localStorage.setItem(CLOUD_CONFIG_KEY,JSON.stringify(c));}
-  function esc(v){return typeof escapeHTML==='function'?escapeHTML(v):String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]));}
-  function cloudInit(){
-    const c=cloudConfig();
-    if(!c.url||!c.key||!window.supabase?.createClient){cloudReady=false;return false;}
-    try{cloudClient=window.supabase.createClient(c.url,c.key,{auth:{persistSession:true,autoRefreshToken:true,detectSessionInUrl:true}});cloudReady=true;return true}catch(e){console.error(e);cloudReady=false;return false}
-  }
-  cloudInit();
-  window.noahxCloud={config:cloudConfig,ready:()=>cloudReady,client:()=>cloudClient};
+  const GH_CONFIG_KEY='noahx-github-config-v2';
+  const LEGACY_CONFIG_KEY='noahx-github-config-v1';
+  let githubLoaded=false;
+  let githubAssetRoot='';
+  let syncTimer=null;
 
-  function imagePublicUrl(path){
-    if(!cloudReady||!path)return '';
-    return cloudClient.storage.from(cloudConfig().bucket).getPublicUrl(path).data.publicUrl||'';
-  }
-  async function uploadImage(file,path){
-    if(!cloudReady) throw new Error('クラウド設定が未完了です。');
-    const {error}=await cloudClient.storage.from(cloudConfig().bucket).upload(path,file,{contentType:file.type||'image/jpeg',upsert:true,cacheControl:'3600'});
-    if(error)throw error; return imagePublicUrl(path);
-  }
-  async function deleteImage(path){if(!cloudReady||!path)return; const {error}=await cloudClient.storage.from(cloudConfig().bucket).remove([path]); if(error)console.warn(error)}
-
-  async function loadCloudState(){
-    if(!cloudReady)return;
+  function ghConfig(){
     try{
-      const [{data:posts,error:pe},{data:talentsRows,error:te}]=await Promise.all([
-        cloudClient.from('noahx_posts').select('*'),
-        cloudClient.from('noahx_talents').select('*').order('created_at')
-      ]);
-      if(pe)throw pe;if(te)throw te;
-      cloudPostsCache=posts||[]; cloudTalentRows=talentsRows||[];
-      const baseCount=window.__noahxBaseTalentCount||talents.length;
-      for(const row of cloudTalentRows){
-        const data=row.data||{};
-        if(row.base_index!==null && row.base_index!==undefined && talents[row.base_index]) Object.assign(talents[row.base_index],data);
-        else if(row.base_index===null && !talents.some(t=>t.__cloudId===row.id)){data.__cloudId=row.id;talents.push(data)}
-      }
-      for(const row of cloudPostsCache){
-        const ti=Number(row.talent_index); const d=row.data||{};
-        if(!talents[ti])continue;
-        d.id=row.id; d.talentId=String(ti); d._cloud=true; d.imagePath=row.image_path||d.imagePath||''; d.imageUrl=imagePublicUrl(d.imagePath);
-      }
-      cloudLoaded=true;
-      if(typeof createTalentCards==='function')createTalentCards();
-      if(typeof populateAdminTalents==='function')populateAdminTalents();
-      if(typeof refreshTalentEditorSelect==='function')refreshTalentEditorSelect();
-      if(typeof refreshPostEditorChoicesFinal==='function')await refreshPostEditorChoicesFinal();
-      if(typeof renderHashtagDirectoryFinal==='function')await renderHashtagDirectoryFinal();
-      if(typeof renderLatestPosts==='function')renderLatestPosts();
-    }catch(e){console.error('クラウドデータ取得失敗',e);showCloudStatus('クラウドデータ取得失敗：'+e.message,true)}
-  }
-
-  async function saveCloudPost(record,file){
-    if(!cloudReady)throw new Error('Supabase未設定です。');
-    const id=String(record.id);
-    let imagePath=record.imagePath||'';
-    if(file){
-      const ext=(file.name.split('.').pop()||'jpg').toLowerCase().replace(/[^a-z0-9]/g,'')||'jpg';
-      imagePath=`posts/${String(record.talentId)}/${id}.${ext}`;
-      await uploadImage(file,imagePath);
+      const current=JSON.parse(localStorage.getItem(GH_CONFIG_KEY)||'null');
+      const legacy=JSON.parse(localStorage.getItem(LEGACY_CONFIG_KEY)||'null');
+      return Object.assign({owner:'',repo:'',branch:'main',token:'',path:'index.html'},legacy||{},current||{});
+    }catch(e){
+      return {owner:'',repo:'',branch:'main',token:'',path:'index.html'};
     }
-    const data={...record}; delete data.imageBlob; delete data.imageUrl; delete data._objectUrl; delete data._local; delete data._cloud; delete data.imagePath;
-    const {error}=await cloudClient.from('noahx_posts').upsert({id,talent_index:Number(record.talentId),data,image_path:imagePath,updated_at:new Date().toISOString()},{onConflict:'id'});
-    if(error)throw error;
-    return {id,imagePath,imageUrl:imagePublicUrl(imagePath)};
-  }
-  async function deleteCloudPost(id){
-    if(!cloudReady)throw new Error('Supabase未設定です。');
-    const row=cloudPostsCache.find(r=>String(r.id)===String(id));
-    const {error}=await cloudClient.from('noahx_posts').delete().eq('id',id); if(error)throw error;
-    if(row?.image_path)await deleteImage(row.image_path);
-    cloudPostsCache=cloudPostsCache.filter(r=>String(r.id)!==String(id));
   }
 
-  async function saveCloudTalent(index,data){
-    if(!cloudReady)throw new Error('Supabase未設定です。');
-    const isBase=index < (window.__noahxBaseTalentCount||0);
-    let row=cloudTalentRows.find(r=>isBase ? Number(r.base_index)===Number(index) : r.id===talents[index]?.__cloudId);
-    const payload={data:{...data},base_index:isBase?Number(index):null,updated_at:new Date().toISOString()};
-    if(row)payload.id=row.id;
-    else if(!isBase)payload.id=crypto.randomUUID();
-    const {data:out,error}=await cloudClient.from('noahx_talents').upsert(payload,{onConflict:'id'}).select().single();
-    if(error)throw error;
-    if(!isBase)talents[index].__cloudId=out.id;
-    const i=cloudTalentRows.findIndex(r=>r.id===out.id); if(i>=0)cloudTalentRows[i]=out;else cloudTalentRows.push(out);
+  function saveGhConfig(c){
+    localStorage.setItem(GH_CONFIG_KEY,JSON.stringify(Object.assign({path:'index.html'},c)));
   }
 
-  async function saveCloudSiteState(){
-    if(!cloudReady)return;
-    const data={siteUpdate:typeof siteUpdate!=='undefined'?siteUpdate:null};
-    const {error}=await cloudClient.from('noahx_site_state').upsert({key:'main',data,updated_at:new Date().toISOString()},{onConflict:'key'}); if(error)throw error;
+  function ghStatus(message,error=false){
+    const el=document.getElementById('noahxGitHubStatus');
+    if(el){el.textContent=message;el.style.color=error?'#b91c1c':'#166534';}
   }
 
-  function cloudPostsForTalent(talentIndex){return cloudPostsCache.filter(r=>Number(r.talent_index)===Number(talentIndex)).map(r=>({...r.data,id:r.id,talentId:String(talentIndex),_cloud:true,imagePath:r.image_path||'',imageUrl:imagePublicUrl(r.image_path||'')}))}
-  function localCloudMerged(talent){const ti=talents.indexOf(talent);return cloudPostsForTalent(ti)}
-
-  // Override the local-only post source. Existing HTML posts remain intact; cloud posts are appended.
-  const oldGetLocalPosts=window.getLocalPosts;
-  window.getLocalPosts=async function(talent){
-    const ti=talents.indexOf(talent);
-    const cloud=cloudLoaded?cloudPostsForTalent(ti):[];
-    let local=[]; try{local=oldGetLocalPosts?await oldGetLocalPosts(talent):[]}catch{}
-    return [...local,...cloud];
-  };
-  const oldGetAllLocalPosts=window.getAllLocalPosts;
-  window.getAllLocalPosts=async function(){
-    let local=[];try{local=oldGetAllLocalPosts?await oldGetAllLocalPosts():[]}catch{}
-    const cloud=cloudPostsCache.map(r=>({...r.data,id:r.id,talentId:String(r.talent_index),_cloud:true,imagePath:r.image_path||'',imageUrl:imagePublicUrl(r.image_path||'')}));
-    return [...local.filter(x=>!x._cloud),...cloud];
-  };
-  const oldSaveLocalPost=window.saveLocalPost;
-  window.saveLocalPost=async function(record){
-    if(cloudReady && sessionStorage.getItem('noahx_admin_authenticated')==='1'){
-      const file=record.imageBlob instanceof Blob?record.imageBlob:null;
-      const saved=await saveCloudPost(record,file);
-      record.imagePath=saved.imagePath;record.imageUrl=saved.imageUrl;record._cloud=true;
-      cloudPostsCache=cloudPostsCache.filter(r=>String(r.id)!==String(record.id));
-      cloudPostsCache.push({id:String(record.id),talent_index:Number(record.talentId),data:{...record,imageBlob:undefined},image_path:saved.imagePath});
-      try{await oldSaveLocalPost?.(record)}catch{}
-      return;
+  function ghApiBase(requireToken=true){
+    const c=ghConfig();
+    if(!c.owner||!c.repo||!c.branch||(requireToken&&!c.token)){
+      throw new Error(requireToken?'GitHubのOwner / Repository / Branch / Tokenを設定してください。':'GitHubのOwner / Repository / Branchを設定してください。');
     }
-    return oldSaveLocalPost?oldSaveLocalPost(record):undefined;
-  };
-  const oldDeleteLocalPost=window.deleteLocalPost;
-  window.deleteLocalPost=async function(id){
-    if(cloudReady && sessionStorage.getItem('noahx_admin_authenticated')==='1' && cloudPostsCache.some(r=>String(r.id)===String(id))){await deleteCloudPost(id);try{await oldDeleteLocalPost?.(id)}catch{};return}
-    return oldDeleteLocalPost?oldDeleteLocalPost(id):undefined;
-  };
+    return 'https://api.github.com/repos/'+encodeURIComponent(c.owner)+'/'+encodeURIComponent(c.repo);
+  }
 
-  // Cloud image rendering: getPostImageBase is used throughout the existing renderer.
-  const originalPostImageBase = window.getPostImageBase;
+  async function ghRequest(url,options={}){
+    const c=ghConfig();
+    const headers=Object.assign({'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'},options.headers||{});
+    if(c.token)headers.Authorization='Bearer '+c.token;
+    const response=await fetch(url,Object.assign({},options,{headers}));
+    const text=await response.text();
+    let data=null;
+    try{data=text?JSON.parse(text):null;}catch(e){data={message:text};}
+    if(!response.ok)throw new Error(data?.message||('GitHub API error '+response.status));
+    return data;
+  }
+
+  async function getGhFile(path){
+    const c=ghConfig();
+    const url=ghApiBase(true)+'/contents/'+path.split('/').map(encodeURIComponent).join('/')+'?ref='+encodeURIComponent(c.branch);
+    return ghRequest(url,{method:'GET'});
+  }
+
+  async function putGhFile(path,base64,message,sha){
+    const c=ghConfig();
+    const url=ghApiBase(true)+'/contents/'+path.split('/').map(encodeURIComponent).join('/');
+    const body={message,content:base64,branch:c.branch};
+    if(sha)body.sha=sha;
+    return ghRequest(url,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  }
+
+  function decodeBase64Utf8(base64){
+    const clean=String(base64||'').replace(/\s/g,'');
+    const bin=atob(clean);
+    const bytes=new Uint8Array(bin.length);
+    for(let i=0;i<bin.length;i++)bytes[i]=bin.charCodeAt(i);
+    return new TextDecoder('utf-8').decode(bytes);
+  }
+
+  function utf8Base64(text){
+    const bytes=new TextEncoder().encode(text);
+    let binary='';
+    const chunk=0x8000;
+    for(let i=0;i<bytes.length;i+=chunk)binary+=String.fromCharCode(...bytes.subarray(i,Math.min(i+chunk,bytes.length)));
+    return btoa(binary);
+  }
+
+  function findBalanced(source,startCharIndex,openChar,closeChar){
+    let depth=0,quote=null,escape=false,lineComment=false,blockComment=false;
+    for(let i=startCharIndex;i<source.length;i++){
+      const ch=source[i],next=source[i+1];
+      if(lineComment){if(ch==='\n')lineComment=false;continue;}
+      if(blockComment){if(ch==='*'&&next==='/'){blockComment=false;i++;}continue;}
+      if(quote){
+        if(escape){escape=false;continue;}
+        if(ch==='\\'){escape=true;continue;}
+        if(ch===quote)quote=null;
+        continue;
+      }
+      if(ch==='/'&&next==='/'){lineComment=true;i++;continue;}
+      if(ch==='/'&&next==='*'){blockComment=true;i++;continue;}
+      if(ch==='"'||ch==="'"||ch==='`'){quote=ch;continue;}
+      if(ch===openChar)depth++;
+      else if(ch===closeChar){
+        depth--;
+        if(depth===0)return {text:source.slice(startCharIndex,i+1),end:i+1};
+      }
+    }
+    throw new Error('GitHub上のデータ構造を読み取れませんでした。');
+  }
+
+  function extractJsValue(source,marker,openChar,closeChar){
+    const markerIndex=source.indexOf(marker);
+    if(markerIndex<0)throw new Error(marker+' がGitHub上のindex.htmlに見つかりません。');
+    const open=source.indexOf(openChar,markerIndex+marker.length);
+    if(open<0)throw new Error(marker+' のデータ開始位置が見つかりません。');
+    return findBalanced(source,open,openChar,closeChar).text;
+  }
+
+  function parseJsValue(source,marker,openChar,closeChar){
+    const literal=extractJsValue(source,marker,openChar,closeChar);
+    try{
+      return Function('"use strict";return ('+literal+');')();
+    }catch(e){
+      throw new Error(marker+' のデータ解析に失敗しました：'+e.message);
+    }
+  }
+
+  function setRemoteAssetRoot(){
+    const c=ghConfig();
+    githubAssetRoot='https://raw.githubusercontent.com/'+encodeURIComponent(c.owner)+'/'+encodeURIComponent(c.repo)+'/'+encodeURIComponent(c.branch)+'/';
+  }
+
+  function remoteImageBase(type,id){
+    const v=String(id||'');
+    if(/^(https?:|data:|blob:)/i.test(v))return v;
+    if(!githubLoaded||!githubAssetRoot)return '';
+    return githubAssetRoot+'images/'+encodeURIComponent(type)+'/'+encodeURIComponent(id);
+  }
+
+  function remotePostImageBase(talentId,id){
+    const v=String(id||'');
+    if(/^(https?:|data:|blob:)/i.test(v))return v;
+    if(!githubLoaded||!githubAssetRoot)return '';
+    return githubAssetRoot+'images/posts/'+encodeURIComponent(talentId)+'/'+encodeURIComponent(id);
+  }
+
+  // GitHubを読み込んだ後は、画像もGitHub上の実ファイルを直接参照する。
+  const originalGetImageBase=window.getImageBase;
+  window.getImageBase=function(type,id){
+    const remote=remoteImageBase(type,id);
+    return remote|| (originalGetImageBase?originalGetImageBase(type,id):'');
+  };
+  const originalGetPostImageBase=window.getPostImageBase;
   window.getPostImageBase=function(talentId,id){
-    const ti=talents.findIndex(t=>String(t.postFolder||t.imageId)===String(talentId));
-    const row=cloudPostsCache.find(r=>Number(r.talent_index)===ti && String(r.id)===String(id));
-    if(row?.image_path)return imagePublicUrl(row.image_path);
-    return originalPostImageBase ? originalPostImageBase(talentId,id) : '';
+    const remote=remotePostImageBase(talentId,id);
+    return remote|| (originalGetPostImageBase?originalGetPostImageBase(talentId,id):'');
   };
 
-  // Cloud talent overrides/custom talent persistence.
-  const oldSaveTalentAdminData=window.saveTalentAdminData;
-  window.saveTalentAdminData=async function(){
-    const baseCount=window.__noahxBaseTalentCount||talents.length;
-    try{for(let i=0;i<talents.length;i++)await saveCloudTalent(i,JSON.parse(JSON.stringify(talents[i])));}
-    catch(e){console.error('クラウドタレント保存失敗',e);showCloudStatus('タレント保存失敗：'+e.message,true);throw e}
-    try{oldSaveTalentAdminData?.()}catch{}
-  };
+  function refreshAllViews(){
+    window.__noahxBaseTalentCount=talents.length;
+    try{createTalentCards();}catch(e){console.warn('カード再描画:',e);}
+    try{refreshTalentEditorSelect();}catch(e){console.warn('タレント選択再描画:',e);}
+    try{populateAdminTalents();}catch(e){console.warn('管理タレント再描画:',e);}
+    try{refreshPostEditorChoicesFinal();}catch(e){console.warn('投稿選択再描画:',e);}
+    try{renderSiteUpdate();}catch(e){console.warn('サイト更新再描画:',e);}
+    try{renderLatestPosts();}catch(e){console.warn('最新投稿再描画:',e);}
+    try{renderHashtagDirectory();}catch(e){console.warn('ハッシュタグ再描画:',e);}
+    try{renderHashtagDirectoryFinal();}catch(e){console.warn('ハッシュタグ再描画2:',e);}
+    try{renderCurrentCalendar();}catch(e){/* カレンダー対象未選択なら無視 */}
+    try{refreshAdminPostList();}catch(e){/* 管理画面を開いていない場合は無視 */}
+  }
 
-  // Make existing talent editor submit wait for the cloud write and show a clear message.
-  document.addEventListener('submit',async function(ev){
-    if(ev.target?.id!=='talentEditorForm'||!cloudReady)return;
-    // Existing handler already ran because it is registered earlier. We only force a full sync from current state.
-    setTimeout(async()=>{try{await window.saveTalentAdminData();await loadCloudState();showCloudStatus('タレント情報を全国公開データへ保存しました。',false)}catch(e){showCloudStatus('全国公開保存に失敗しました：'+e.message,true)}},50);
+  async function loadLatestFromGitHub(){
+    const c=ghConfig();
+    if(!c.owner||!c.repo||!c.branch||!c.token)throw new Error('GitHubのOwner / Repository / Branch / Tokenを設定してください。');
+
+    ghStatus('① GitHubから最新のindex.htmlを取得しています…');
+    const file=await getGhFile(c.path||'index.html');
+    const html=decodeBase64Utf8(file.content);
+
+    ghStatus('② 最新のタレント・投稿・サイト情報を読み込んでいます…');
+    const remoteSiteUpdate=parseJsValue(html,'const siteUpdate =','{','}');
+    const remoteTalents=parseJsValue(html,'const talents =','[',']');
+    if(!Array.isArray(remoteTalents))throw new Error('GitHubのtalentsデータが配列ではありません。');
+
+    // 現在のconst配列そのものを置き換えず、中身だけ更新する。
+    talents.splice(0,talents.length,...remoteTalents);
+    if(typeof siteUpdate==='object'&&siteUpdate!==null){
+      Object.keys(siteUpdate).forEach(k=>delete siteUpdate[k]);
+      Object.assign(siteUpdate,remoteSiteUpdate||{});
+    }
+
+    // ローカルの一時データがGitHubより後から上書きしないようにする。
+    try{localStorage.removeItem('noahxTalentAdminData');}catch(e){}
+    try{localStorage.removeItem('noahxSiteAdminData');}catch(e){}
+
+    githubLoaded=true;
+    setRemoteAssetRoot();
+    refreshAllViews();
+
+    ghStatus('③ 最新データの読み込み完了。GitHubを正本として表示しています。');
+    return {file,html,talents:remoteTalents,siteUpdate:remoteSiteUpdate};
+  }
+
+  function dataUrlParts(dataUrl){
+    const m=String(dataUrl||'').match(/^data:([^;,]+)?(;base64)?,(.*)$/s);
+    if(!m)return null;
+    return {mime:m[1]||'image/jpeg',base64:m[2]?m[3]:btoa(unescape(encodeURIComponent(decodeURIComponent(m[3]))))};
+  }
+
+  async function blobToBase64(blob){
+    const buffer=await blob.arrayBuffer();
+    let binary='';
+    const bytes=new Uint8Array(buffer);
+    for(let i=0;i<bytes.length;i+=0x8000)binary+=String.fromCharCode(...bytes.subarray(i,Math.min(i+0x8000,bytes.length)));
+    return btoa(binary);
+  }
+
+  function extFromMime(mime){
+    const m=String(mime||'image/jpeg').toLowerCase();
+    if(m.includes('png'))return 'png';
+    if(m.includes('webp'))return 'webp';
+    if(m.includes('gif'))return 'gif';
+    return 'jpeg';
+  }
+
+  function safeFileId(v,fallback){
+    const x=String(v||fallback||'image').trim().replace(/[^a-zA-Z0-9._-]+/g,'-');
+    return x||fallback||'image';
+  }
+
+  async function imageFromPost(post){
+    if(post?.imageBlob instanceof Blob)return {base64:await blobToBase64(post.imageBlob),mime:post.imageBlob.type||post.imageType||'image/jpeg'};
+    if(post?.imageUrl){
+      try{const r=await fetch(post.imageUrl,{cache:'no-store'});if(r.ok){const b=await r.blob();return {base64:await blobToBase64(b),mime:b.type||post.imageType||'image/jpeg'};}}catch(e){}
+    }
+    return null;
+  }
+
+  async function uploadImage(path,base64,message){
+    let sha=null;
+    try{sha=(await getGhFile(path)).sha;}catch(e){if(!/404|Not Found/i.test(e.message))throw e;}
+    return putGhFile(path,base64,message,sha);
+  }
+
+  function cleanObject(value){
+    if(value===undefined||value instanceof Blob)return undefined;
+    if(value&&typeof value==='object'){
+      if(Array.isArray(value))return value.map(cleanObject).filter(v=>v!==undefined);
+      const out={};
+      Object.keys(value).forEach(k=>{
+        if(['_objectUrl','imageBlob','imageUrl','imagePath','__hiddenByAdmin'].includes(k))return;
+        const v=cleanObject(value[k]);
+        if(v!==undefined)out[k]=v;
+      });
+      return out;
+    }
+    return value;
+  }
+
+  async function readLocalPosts(){
+    try{return typeof getAllLocalPosts==='function'?await getAllLocalPosts():[];}catch(e){return [];}
+  }
+
+  async function prepareTalentData(){
+    const data=JSON.parse(JSON.stringify(cleanObject(talents)));
+    const localPosts=await readLocalPosts();
+    for(const p of localPosts){
+      const ti=Number(p?.talentId),talent=data[ti];
+      if(!talent||!p?.id)continue;
+      if(!Array.isArray(talent.posts))talent.posts=[];
+      const clean=cleanObject(Object.assign({},p));
+      delete clean.talentId;delete clean._cloud;
+      const exists=talent.posts.some(x=>String(x?.imageId||x?.id||'')===String(p.imageId||p.id));
+      if(!exists)talent.posts.push(clean);
+    }
+    for(let i=0;i<data.length;i++){
+      const talent=data[i],current=talents[i];
+      if(!talent)continue;
+      const raw=String(current?.imageId||'');
+      const parts=dataUrlParts(raw);
+      if(parts){
+        const ext=extFromMime(parts.mime),base=safeFileId('talent-'+i),path='images/'+(talent.type||'cosplayer')+'/'+base+'.'+ext;
+        await uploadImage(path,parts.base64,'NoahX: update talent image '+(talent.name||base));
+        talent.imageId=base;
+      }
+    }
+    for(let ti=0;ti<data.length;ti++){
+      const talent=data[ti];if(!talent)continue;
+      const folder=safeFileId(talent.postFolder||talent.imageId||('talent-'+ti));
+      const originals=Array.isArray(talents[ti]?.posts)?talents[ti].posts:[];
+      const merged=Array.isArray(talent.posts)?talent.posts:[];
+      for(let pi=0;pi<merged.length;pi++){
+        const post=merged[pi];if(!post?.imageId)continue;
+        const original=originals.find(x=>String(x?.imageId||'')===String(post.imageId||''));
+        let img=null;
+        if(original?.imageBlob instanceof Blob)img={base64:await blobToBase64(original.imageBlob),mime:original.imageBlob.type||'image/jpeg'};
+        else{const source=localPosts.find(x=>Number(x?.talentId)===ti&&String(x?.imageId||x?.id||'')===String(post.imageId||''));if(source)img=await imageFromPost(source);}
+        if(img){
+          const ext=extFromMime(img.mime),imageId=safeFileId(post.imageId,'post-'+pi),path='images/posts/'+folder+'/'+imageId+'.'+ext;
+          await uploadImage(path,img.base64,'NoahX: update post image '+imageId);
+          post.imageId=imageId;
+        }
+        delete post.imageBlob;delete post.imageUrl;delete post.imagePath;delete post._local;delete post._objectUrl;
+      }
+    }
+    return data;
+  }
+
+  function replaceJsValue(source,marker,newValue,openChar,closeChar){
+    const markerIndex=source.indexOf(marker);
+    if(markerIndex<0)throw new Error(marker+' がindex.html内に見つかりません。');
+    const open=source.indexOf(openChar,markerIndex+marker.length);
+    if(open<0)throw new Error(marker+' の開始位置が見つかりません。');
+    const balanced=findBalanced(source,open,openChar,closeChar);
+    return source.slice(0,open)+JSON.stringify(newValue,null,4)+source.slice(balanced.end);
+  }
+
+  async function publishToGitHub(){
+    const owner=document.getElementById('noahxGitHubOwner')?.value.trim()||ghConfig().owner;
+    const repo=document.getElementById('noahxGitHubRepo')?.value.trim()||ghConfig().repo;
+    const branch=document.getElementById('noahxGitHubBranch')?.value.trim()||'main';
+    const token=document.getElementById('noahxGitHubToken')?.value.trim()||ghConfig().token;
+    saveGhConfig({owner,repo,branch,token,path:'index.html'});
+    if(!owner||!repo||!branch||!token)throw new Error('GitHub設定が不足しています。');
+
+    ghStatus('① GitHubの現在のindex.htmlを取得しています…');
+    const file=await getGhFile('index.html');
+    const decoded=decodeBase64Utf8(file.content);
+    ghStatus('② 管理画面の最新データと画像をまとめています…');
+    const prepared=await prepareTalentData();
+    let next=decoded;
+    next=replaceJsValue(next,'const siteUpdate =',typeof siteUpdate!=='undefined'?siteUpdate:{},'{','}');
+    next=replaceJsValue(next,'const talents =',prepared,'[',']');
+    ghStatus('③ GitHubへindex.htmlを保存しています…');
+    await putGhFile('index.html',utf8Base64(next),'NoahX: update site data and images',file.sha);
+    githubLoaded=true;setRemoteAssetRoot();
+    ghStatus('保存完了。GitHub Pagesへの反映を待っています。');
+  }
+
+  function ensureGitHubCard(){
+    const admin=document.querySelector('#adminPage .admin-panel');
+    if(!admin||document.getElementById('noahxGitHubCard'))return;
+    const c=ghConfig();
+    const card=document.createElement('section');
+    card.className='admin-card';card.id='noahxGitHubCard';
+    card.innerHTML=`
+      <div class="admin-list-header"><h2>GitHub データ管理</h2><span id="noahxGitHubBadge" class="admin-note">${c.owner&&c.repo?'設定済み':'未設定'}</span></div>
+      <p class="admin-note">GitHub上の <strong>index.html・投稿データ・画像</strong> をサイトの正本として使用します。まず「最新を読み込む」でGitHubの状態を管理画面へ反映し、編集後に「GitHubへ保存」してください。</p>
+      <div class="admin-grid-2">
+        <label>Owner / ユーザー名<input id="noahxGitHubOwner" type="text" value="${escapeHTML(c.owner||'')}" placeholder="例：your-account"></label>
+        <label>Repository<input id="noahxGitHubRepo" type="text" value="${escapeHTML(c.repo||'')}" placeholder="例：noahx-japan"></label>
+      </div>
+      <div class="admin-grid-2">
+        <label>Branch<input id="noahxGitHubBranch" type="text" value="${escapeHTML(c.branch||'main')}" placeholder="main"></label>
+        <label>Token<input id="noahxGitHubToken" type="password" value="${escapeHTML(c.token||'')}" placeholder="github_pat_..."></label>
+      </div>
+      <div class="admin-actions">
+        <button type="button" class="admin-primary" id="noahxGitHubLoad">GitHubから最新を読み込む</button>
+        <button type="button" class="admin-primary" id="noahxGitHubPublish">GitHubへ保存</button>
+        <button type="button" class="admin-secondary" id="noahxGitHubTest">接続テスト</button>
+      </div>
+      <div id="noahxGitHubStatus" class="admin-note">${c.owner&&c.repo&&c.token?'接続情報は保存済みです。':'Owner / Repository / Branch / Tokenを設定してください。'}</div>
+      <p class="admin-note">⚠️ Fine-grained PATを推奨します。対象Repositoryだけに限定し、Contents: Read and writeを付与してください。</p>`;
+    admin.prepend(card);
+
+    const saveInputs=()=>saveGhConfig({owner:card.querySelector('#noahxGitHubOwner').value.trim(),repo:card.querySelector('#noahxGitHubRepo').value.trim(),branch:card.querySelector('#noahxGitHubBranch').value.trim()||'main',token:card.querySelector('#noahxGitHubToken').value.trim(),path:'index.html'});
+
+    card.querySelector('#noahxGitHubTest').onclick=async()=>{try{saveInputs();ghStatus('GitHubへ接続しています…');await getGhFile('index.html');ghStatus('接続成功。GitHubのindex.htmlを取得できます。');}catch(e){ghStatus('接続失敗：'+e.message,true);}};
+    card.querySelector('#noahxGitHubLoad').onclick=async()=>{const b=card.querySelector('#noahxGitHubLoad');try{saveInputs();b.disabled=true;await loadLatestFromGitHub();}catch(e){console.error(e);ghStatus('読み込み失敗：'+e.message,true);}finally{b.disabled=false;}};
+    card.querySelector('#noahxGitHubPublish').onclick=async()=>{const b=card.querySelector('#noahxGitHubPublish');try{saveInputs();b.disabled=true;await publishToGitHub();}catch(e){console.error(e);ghStatus('保存失敗：'+e.message,true);}finally{b.disabled=false;}};
+  }
+
+  function scheduleGitHubSync(){
+    const c=ghConfig();
+    if(!githubLoaded||!c.owner||!c.repo||!c.token)return;
+    clearTimeout(syncTimer);
+    syncTimer=setTimeout(()=>publishToGitHub().catch(e=>console.warn('GitHub自動保存:',e)),1500);
+  }
+
+  // 管理画面の保存はローカル処理を維持しつつ、GitHubを読み込んでいる時だけ自動同期する。
+  if(typeof window.saveTalentAdminData==='function'){
+    const old=window.saveTalentAdminData;
+    window.saveTalentAdminData=async function(){const r=await old.apply(this,arguments);scheduleGitHubSync();return r;};
+  }
+  if(typeof window.saveLocalPost==='function'){
+    const old=window.saveLocalPost;
+    window.saveLocalPost=async function(){const r=await old.apply(this,arguments);scheduleGitHubSync();return r;};
+  }
+  if(typeof window.deleteLocalPost==='function'){
+    const old=window.deleteLocalPost;
+    window.deleteLocalPost=async function(){const r=await old.apply(this,arguments);scheduleGitHubSync();return r;};
+  }
+  document.addEventListener('submit',ev=>{
+    if(['siteDataEditorForm','talentEditorForm','postUploadForm','postEditorForm'].includes(ev.target?.id))setTimeout(scheduleGitHubSync,200);
   },true);
 
-  // Existing base-post edits call saveTalentAdminData; that now syncs talent JSON including posts.
-  async function migrateExistingLocalPosts(){
-    if(!cloudReady||sessionStorage.getItem('noahx_admin_authenticated')!=='1')return;
-    let all=[];try{all=await (oldGetAllLocalPosts?oldGetAllLocalPosts():[])}catch{}
-    for(const p of all){if(!p?.id||p._cloud)continue;try{await saveCloudPost(p,p.imageBlob instanceof Blob?p.imageBlob:null)}catch(e){console.warn('既存ローカル投稿移行失敗',p.id,e)}}
-    await migrateBasePostsToCloud();
-    await loadCloudState();
-  }
+  const oldOpen=window.openAdminPage;
+  if(oldOpen)window.openAdminPage=function(){const r=oldOpen.apply(this,arguments);setTimeout(ensureGitHubCard,50);return r;};
 
-  async function migrateBasePostsToCloud(){
-    if(!cloudReady||sessionStorage.getItem('noahx_admin_authenticated')!=='1')return;
-    for(let ti=0;ti<talents.length;ti++){
-      const talent=talents[ti];
-      const posts=Array.isArray(talent?.posts)?talent.posts:[];
-      for(const post of posts){
-        if(!post?.id||cloudPostsCache.some(r=>String(r.id)===String(post.id)))continue;
-        try{
-          let blob=null;
-          if(post.imageId){
-            const base=originalPostImageBase?originalPostImageBase(talent.postFolder||talent.imageId||'',post.imageId):'';
-            if(base){
-              const response=await fetch(base,{cache:'no-store'});
-              if(response.ok) blob=await response.blob();
-            }
-          }
-          const record={...post,talentId:String(ti)};
-          const saved=await saveCloudPost(record,blob);
-          cloudPostsCache.push({id:String(record.id),talent_index:ti,data:{...record,imageBlob:undefined},image_path:saved.imagePath});
-        }catch(e){console.warn('既存HTML投稿のクラウド移行失敗',post.id,e)}
-      }
-    }
-  }
-
-  function showCloudStatus(message,error){
-    const el=document.getElementById('noahxCloudStatus'); if(!el)return;
-    el.textContent=message;el.style.color=error?'#b91c1c':'#166534';
-  }
-  function ensureCloudCard(){
-    const admin=document.querySelector('#adminPage .admin-panel'); if(!admin||document.getElementById('noahxCloudCard'))return;
-    const card=document.createElement('div');card.className='admin-card';card.id='noahxCloudCard';
-    const c=cloudConfig();
-    card.innerHTML=`<h2>全国公開クラウド設定</h2><p class="admin-note">管理者が投稿すると、Supabase DatabaseとStorageへ保存し、全国の端末から同じ投稿を取得します。公開用Publishable/anon keyのみを使用し、service_role keyは絶対に入力しないでください。</p><label>Supabase Project URL<input id="noahxCloudUrl" type="url" value="${esc(c.url)}" placeholder="https://xxxx.supabase.co"></label><label>Supabase Publishable / anon Key<input id="noahxCloudKey" type="password" value="${esc(c.key)}" placeholder="sb_publishable_... または anon key"></label><label>Storage Bucket<input id="noahxCloudBucket" type="text" value="${esc(c.bucket)}"></label><div class="admin-actions"><button type="button" class="admin-primary" id="noahxCloudSave">接続して保存</button><button type="button" class="admin-secondary" id="noahxCloudMigrate">既存投稿をクラウドへ移行</button></div><div id="noahxCloudStatus" class="admin-note">${cloudReady?'クラウド接続設定済み':'未設定：現在は従来のローカル保存です'}</div>`;
-    admin.prepend(card);
-    card.querySelector('#noahxCloudSave').onclick=async()=>{setCloudConfig({url:card.querySelector('#noahxCloudUrl').value.trim(),key:card.querySelector('#noahxCloudKey').value.trim(),bucket:card.querySelector('#noahxCloudBucket').value.trim()||'noahx-images'});if(!cloudInit()){showCloudStatus('URL / Keyを確認してください。',true);return}try{const {error}=await cloudClient.from('noahx_posts').select('id').limit(1);if(error)throw error;showCloudStatus('Supabase接続成功。全国公開モードです。',false);await loadCloudState()}catch(e){showCloudStatus('接続失敗：SQL設定またはRLSを確認してください。'+e.message,true)}};
-    card.querySelector('#noahxCloudMigrate').onclick=async()=>{try{await migrateExistingLocalPosts();showCloudStatus('既存投稿の移行が完了しました。',false);if(typeof refreshAdminPostList==='function')await refreshAdminPostList()}catch(e){showCloudStatus('移行失敗：'+e.message,true)}};
-  }
-
-  // Cloud-aware admin login: ID欄にSupabase Authの管理者メール、パスワード欄にAuthパスワードを入力。
-  const loginForm=document.getElementById('adminLoginForm');
-  if(loginForm){
-    loginForm.addEventListener('submit',async function(ev){
-      if(!cloudReady)return;
-      ev.preventDefault();ev.stopImmediatePropagation();
-      const email=document.getElementById('adminLoginId')?.value.trim();const pass=document.getElementById('adminLoginPassword')?.value||'';
-      const {error}=await cloudClient.auth.signInWithPassword({email,password:pass});
-      if(error){document.getElementById('adminLoginError').textContent='Supabase管理者ログインに失敗しました。';return}
-      sessionStorage.setItem('noahx_admin_authenticated','1');closeAdminLogin();openAdminPage();await loadCloudState();await migrateExistingLocalPosts();ensureCloudCard();
-    },true);
-  }
-
-  const oldOpenAdmin=window.openAdminPage;
-  window.openAdminPage=function(){const r=oldOpenAdmin?oldOpenAdmin.apply(this,arguments):undefined;setTimeout(ensureCloudCard,0);return r};
-
-  async function bootCloud(){
-    if(!cloudReady)return;
-    try{await loadCloudState();}catch(e){console.warn(e)}
-  }
-  if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',bootCloud);else bootCloud();
+  window.__noahxGitHub={load:loadLatestFromGitHub,publish:publishToGitHub,config:ghConfig};
+  if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',()=>setTimeout(ensureGitHubCard,100));
+  else setTimeout(ensureGitHubCard,100);
 })();
 </script>
-
-
-<!-- Supabase cloud layer is unified above. -->
 
 </body>
 
