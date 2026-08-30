@@ -1,0 +1,28 @@
+NoahX Japan - Supabase setup
+============================
+
+1. Supabase Dashboardを開く
+2. SQL Editorで supabase_setup.sql の内容を全部実行
+3. Authentication > Users で管理者ユーザーを作成
+   - メールアドレス = 管理画面の「管理者ID」に入力するメール
+   - パスワード = そのユーザーのパスワード
+4. index.html をWebサーバーへ公開
+5. 管理画面 → 管理者ログイン
+6. Supabase接続設定で「接続して保存」
+7. 「既存投稿をクラウドへ移行」を1回実行
+
+動作
+----
+・新規投稿画像 → Supabase Storage / noahx-images / posts/<talentIndex>/<postId>.*
+・新規投稿データ → public.noahx_posts
+・タレント編集 → public.noahx_talents
+・サイト状態 → public.noahx_site_state
+・一般閲覧者 → ログイン不要、投稿DBと公開画像を閲覧可能
+・投稿/編集/削除 → Supabase Authでログインしたユーザーのみ
+
+重要
+----
+・HTMLに入っているのは公開用Publishable/anon keyです。
+・service_role keyは絶対にHTMLへ入れないでください。
+・Supabase未接続時は従来どおりIndexedDBへ保存します。
+・既存HTML投稿の移行では、同梱画像をブラウザから取得してStorageへコピーします。
