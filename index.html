@@ -4114,14 +4114,46 @@ img.image-loaded {
             "webp"
         ];
 
+        /*
+         * GitHub Pages の main ブランチを正本にする画像構成。
+         * 現在の noah0620/noahx/main ではタレント画像・SNSアイコンが
+         * リポジトリ直下に配置されているため、まず直下を参照します。
+         * 既存の ./images/... 構成も後方互換として残します。
+         */
+        function hasImageExtension(value) {
+            return /\.(?:jpeg|jpg|png|webp)$/i.test(String(value || ""));
+        }
 
         function imageCandidates(base) {
+            const raw = String(base || "").trim();
+            if (!raw) return [];
+            if (/^(https?:|data:|blob:)/i.test(raw)) return [raw];
 
-            return EXTENSIONS.map(
-                ext =>
-                    `${base}.${ext}`
-            );
+            const clean = raw.replace(/^\.\//, "");
+            const hasExt = hasImageExtension(clean);
+            const names = hasExt
+                ? [clean]
+                : EXTENSIONS.map(ext => `${clean}.${ext}`);
 
+            const candidates = [];
+            const add = value => {
+                const v = value.startsWith("./") ? value : `./${value}`;
+                if (!candidates.includes(v)) candidates.push(v);
+            };
+
+            // main 直下を最優先
+            names.forEach(add);
+
+            // 旧構成も読み込めるようにする
+            names.forEach(name => {
+                const filename = name.split("/").pop();
+                add(`images/${filename}`);
+                add(`images/staff/${filename}`);
+                add(`images/cosplayer/${filename}`);
+                add(`images/icons/${filename}`);
+            });
+
+            return candidates;
         }
 
 
@@ -4169,21 +4201,25 @@ img.image-loaded {
 
 
         function getImageBase(type, id) {
-            const v = String(id || "");
+            const v = String(id || "").trim();
             if (/^(https?:|data:|blob:)/i.test(v)) return v;
-            return `./images/${type}/${id}`;
+            // GitHub main のルートにある全タレント画像を正本として使用
+            return `./${v}`;
         }
 
-
-        const getIconBase =
-            name =>
-                `./images/icons/${name}`;
-
+        const getIconBase = name => {
+            const v = String(name || "").trim();
+            if (/^(https?:|data:|blob:)/i.test(v)) return v;
+            // GitHub main のルートにあるSNSアイコンを正本として使用
+            return `./${v}`;
+        };
 
         function getPostImageBase(talentId, id) {
-            const v = String(id || "");
+            const v = String(id || "").trim();
             if (/^(https?:|data:|blob:)/i.test(v)) return v;
-            return `./images/posts/${talentId}/${id}`;
+            // 投稿画像もまず main 直下を確認。旧 images/posts 構成は
+            // imageCandidates() の後方互換候補で引き続き利用可能。
+            return `./${v}`;
         }
 
 
@@ -6877,6 +6913,7 @@ img.image-loaded {
                                 member.imageId
                             )
                         )}"
+                        data-image-source="github-main-root"
                         alt="${escapeHTML(member.name)}"
                     >
 
@@ -9285,8 +9322,8 @@ let adminPreviewUrl = null;
 ================================= */
 // 注意: HTMLだけの静的サイトでは認証情報を完全に秘密にできません。
 // 実運用ではサーバー側認証に置き換えてください。
-const ADMIN_LOGIN_ID = "ADMIN_ID";
-const ADMIN_LOGIN_PASSWORD = "CHANGE_ME_PASSWORD";
+const ADMIN_LOGIN_ID = "noahx_admin";
+const ADMIN_LOGIN_PASSWORD = "adminpasswordnoa0620";
 
 function requestAdminLogin(event) {
     if (event) event.preventDefault();
@@ -12486,8 +12523,10 @@ ensureHashtagDirectoryFinal();
       {method:'GET'}
     );
 
-    if(repo.private===true && repo.permissions && repo.permissions.push!==true){
-      throw new Error('Repositoryへの書き込み権限がありません。TokenのContents: Read and writeを確認してください。');
+    // GETだけ成功しても書き込み権限があるとは限らない。
+    // public/privateに関係なくGitHub APIが返すpermissions.pushを確認する。
+    if(!repo.permissions || repo.permissions.push !== true){
+      throw new Error('Repositoryは読み取りできますが、書き込み権限がありません。Fine-grained Tokenの対象Repositoryが「noah0620/noahx」になっているか、Contents: Read and write を確認してください。');
     }
 
     ghStatus('② index.htmlの読み取り権限を確認しています…',false);
@@ -12515,23 +12554,37 @@ ensureHashtagDirectoryFinal();
     const cfg=ghConfig();
     if(!cfg.owner||!cfg.repo||!cfg.branch||!cfg.token)throw new Error('GitHub設定が不足しています。');
 
-    // 保存直前に必ず最新SHAを取得する。これで古いSHAによる競合を防ぐ。
-    ghStatus('① 保存直前のGitHub index.htmlを取得しています…',false);
-    const latest=await getLatestIndex();
+    // 先に書き込み権限まで確認する。接続テストだけ成功して保存時に403になる状態を防ぐ。
+    ghStatus('① GitHubの読み書き権限を確認しています…',false);
+    const repo=await ghRequest(
+      'https://api.github.com/repos/'+encodeURIComponent(cfg.owner)+'/'+encodeURIComponent(cfg.repo),
+      {method:'GET'}
+    );
+    if(!repo.permissions || repo.permissions.push!==true){
+      throw new Error('GitHubは読み取れますが書き込み権限がありません。TokenのResource owner、Repository access、Contents: Read and writeを確認してください。');
+    }
 
-    ghStatus('② 管理画面の最新データと画像を準備しています…',false);
+    // 保存直前の最新SHAを取得する。
+    ghStatus('② 保存直前のGitHub index.htmlを取得しています…',false);
+    let latest=await getLatestIndex();
+
+    ghStatus('③ 管理画面の最新データと画像を準備しています…',false);
     const prepared=await prepareTalentData();
 
-    let next=latest.source;
-    next=replaceJsObject(next,'const siteUpdate =',typeof siteUpdate!=='undefined'?siteUpdate:{});
-    next=replaceJsArray(next,'const talents =',prepared);
+    function buildIndex(source){
+      let next=source;
+      next=replaceJsObject(next,'const siteUpdate =',typeof siteUpdate!=='undefined'?siteUpdate:{});
+      next=replaceJsArray(next,'const talents =',prepared);
+      next=next.replace(/\n?<!-- NOAHX_GITHUB_DATA_START -->[\s\S]*?<!-- NOAHX_GITHUB_DATA_END -->/g,'');
+      next+='\n\n'+GH_MARKER_START+
+        '\n<!-- Generated by NoahX GitHub Publisher: '+new Date().toISOString()+' -->'+
+        '\n'+GH_MARKER_END+'\n';
+      return next;
+    }
 
-    next=next.replace(/\n?<!-- NOAHX_GITHUB_DATA_START -->[\s\S]*?<!-- NOAHX_GITHUB_DATA_END -->/g,'');
-    next+='\n\n'+GH_MARKER_START+
-      '\n<!-- Generated by NoahX GitHub Publisher: '+new Date().toISOString()+' -->'+
-      '\n'+GH_MARKER_END+'\n';
+    const next=buildIndex(latest.source);
+    ghStatus('④ index.htmlをGitHubへ保存しています…',false);
 
-    ghStatus('③ GitHubへindex.htmlを保存しています…',false);
     try{
       await putGhFile(
         'index.html',
@@ -12540,13 +12593,30 @@ ensureHashtagDirectoryFinal();
         latest.file.sha
       );
     }catch(e){
+      // 409なら保存直前に別コミットが入った可能性があるため、最新SHAを1回だけ取り直して再試行。
       if(e.status===409){
-        throw new Error('保存中にGitHub側のindex.htmlが変更されました。もう一度「GitHubから最新を読み込む」→「GitHubへ保存」を実行してください。');
+        ghStatus('⑤ GitHub側の更新を検知。最新SHAを取得して再試行しています…',false);
+        latest=await getLatestIndex();
+        const retry=buildIndex(latest.source);
+        try{
+          await putGhFile(
+            'index.html',
+            utf8Base64(retry),
+            'NoahX: retry update index.html from admin',
+            latest.file.sha
+          );
+        }catch(e2){
+          throw new Error('GitHub保存が競合して2回とも失敗しました。GitHub上のindex.htmlを誰かが同時に変更していないか確認してください。HTTP '+(e2.status||'')+'：'+e2.message);
+        }
+      }else if(e.status===403){
+        throw new Error('GitHub APIが書き込みを拒否しました（403）。TokenのContents: Read and write、Repository access＝noahx、Resource owner＝noah0620を確認してください。GitHub側でTokenの承認待ちの場合もあります。');
+      }else if(e.status===404){
+        throw new Error('Repositoryまたはindex.htmlが見つかりません（404）。Owner=noah0620 / Repository=noahx / Branch='+cfg.branch+' を確認してください。');
+      }else if(e.status===422){
+        throw new Error('GitHubが更新内容を受け付けませんでした（422）。index.htmlのSHAまたはBranchが不正な可能性があります。詳細：'+e.message);
+      }else{
+        throw new Error('GitHub保存に失敗しました。HTTP '+(e.status||'不明')+'：'+e.message);
       }
-      if(e.status===403){
-        throw new Error('GitHubから拒否されました。Tokenの対象Repositoryと Contents: Read and write を確認してください。');
-      }
-      throw e;
     }
 
     ghStatus('保存完了：index.htmlと画像をGitHubへ反映しました。GitHub Pagesへの反映には少し時間がかかる場合があります。',false);
